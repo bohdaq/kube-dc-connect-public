@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Deploy the app to a kube-dc project and print its HTTPS URL.
+#
+#   deploy/deploy.sh <namespace> <app> <image>
+#
+# Uses the current kubectl context (CI writes one with a short-lived token).
+# Optional: DB_SECRET (default <app>-db-owner), PULL_USER + PULL_TOKEN to
+# create/refresh the <app>-pull image pull Secret for a private registry,
+# TIMEOUT (rollout, hostname and URL wait, default 300s), HEALTH_PATH
+# (checked on the live URL, default /), PORT (container port, default 8080), and for a preview
+# PREVIEW_HOURS (kube-dc removes it that long after the last deploy),
+# PREVIEW_REPOSITORY + PREVIEW_PULL_REQUEST (and when that pull request
+# closes; public repositories).
+set -euo pipefail
+
+NAMESPACE="$1" APP="$2" IMAGE="$3"
+PORT="${PORT:-8080}" DB_SECRET="${DB_SECRET:-$APP-db-owner}"
+TIMEOUT="${TIMEOUT:-300}"
+cd "$(dirname "$0")"
+
+if [ -n "${PULL_TOKEN:-}" ]; then
+  kubectl -n "$NAMESPACE" create secret docker-registry "$APP-pull" \
+    --docker-server="${IMAGE%%/*}" --docker-username="${PULL_USER:?PULL_USER}" --docker-password="$PULL_TOKEN" \
+    --dry-run=client -o yaml | kubectl -n "$NAMESPACE" apply -f -
+fi
+
+sed -e "s|\${APP}|$APP|g" -e "s|\${IMAGE}|$IMAGE|g" -e "s|\${PORT}|$PORT|g" -e "s|\${DB_SECRET}|$DB_SECRET|g" app.yaml | kubectl -n "$NAMESPACE" apply -f -
+
+if [ -n "${PREVIEW_HOURS:-}" ]; then
+  # Every object of the preview carries its name; the Deployment, when and why it goes.
+  kubectl -n "$NAMESPACE" label --overwrite deployment/"$APP" service/"$APP" preview.kube-dc.com/name="$APP" >/dev/null
+  [ -n "${PULL_TOKEN:-}" ] && kubectl -n "$NAMESPACE" label --overwrite secret/"$APP-pull" preview.kube-dc.com/name="$APP" >/dev/null
+  kubectl -n "$NAMESPACE" annotate --overwrite deployment/"$APP" \
+    preview.kube-dc.com/expires-at="$(date -u -d "+${PREVIEW_HOURS} hours" +%Y-%m-%dT%H:%M:%SZ)" \
+    ${PREVIEW_REPOSITORY:+preview.kube-dc.com/repository="$PREVIEW_REPOSITORY"} \
+    ${PREVIEW_PULL_REQUEST:+preview.kube-dc.com/pull-request="$PREVIEW_PULL_REQUEST"} >/dev/null
+fi
+
+if ! kubectl -n "$NAMESPACE" rollout status "deployment/$APP" --timeout="${TIMEOUT}s"; then
+  echo "Rollout failed. Recent events and logs:"
+  kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp | tail -15 || true
+  kubectl -n "$NAMESPACE" logs "deployment/$APP" --tail=30 || true
+  exit 1
+fi
+
+# The platform writes the hostname once the certificate is issued.
+for _ in $(seq 1 $((TIMEOUT / 5))); do
+  host=$(kubectl -n "$NAMESPACE" get service "$APP" -o jsonpath='{.metadata.annotations.service\.nlb\.kube-dc\.com/route-hostname-status}')
+  [ -n "$host" ] && break
+  sleep 5
+done
+if [ -z "$host" ]; then
+  echo "The Service has no hostname yet; check: kubectl -n $NAMESPACE get events"
+  exit 1
+fi
+
+# Green only when the live URL answers (certificate served, route programmed,
+# app healthy), so the GitHub deployment shows what users get.
+for _ in $(seq 1 $((TIMEOUT / 5))); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "https://$host${HEALTH_PATH:-/}" || true)
+  if [ "$code" -ge 200 ] 2>/dev/null && [ "$code" -lt 400 ]; then
+    echo "url=https://$host"
+    [ -n "${GITHUB_OUTPUT:-}" ] && echo "url=https://$host" >> "$GITHUB_OUTPUT"
+    exit 0
+  fi
+  sleep 5
+done
+echo "https://$host${HEALTH_PATH:-/} did not answer (last status: ${code:-none})."
+kubectl -n "$NAMESPACE" logs "deployment/$APP" --tail=30 || true
+exit 1
